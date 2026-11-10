@@ -27,6 +27,7 @@ PID_FILE="$STATE_DIR/awake.pid"
 DEADLINE_FILE="$STATE_DIR/awake.deadline"
 BATTERY_FILE="$STATE_DIR/awake.battery"
 SAFE_FILE="$STATE_DIR/awake.safe"
+GUI_FILE="$STATE_DIR/awake.gui.pid"
 LOG_FILE="$STATE_DIR/awake.log"
 UPDATE_CHECK_FILE="$STATE_DIR/update-check"
 
@@ -47,9 +48,12 @@ Usage:
   awake -b PERCENT       Auto-stop when battery drops to PERCENT% (on battery).
   awake -s               Auto-stop when the Mac stays hot for 3 minutes.
   awake start            Run in the background (detached). Survives shell exit.
-  awake start -t DURATION -b PERCENT -s
+  awake gui on|off       Toggle GUI display hold without restarting awake.
+  awake start -t DURATION -b PERCENT -s [--gui]
                          Run in the background with time/battery/thermal limits.
-  awake status           Show running state, PID, uptime, and pmset disablesleep.
+  awake --gui            Prevent display idle sleep in foreground mode.
+  awake status           Show running state, GUI mode, PID, and pmset.
+  awake gui status       Show whether display hold is active.
   awake stop             Stop a background awake and restore sleep settings.
   awake -h|--help        Show this help.
   awake -v|--version     Show version.
@@ -70,6 +74,8 @@ Safe mode (-s / --safe):
   is not kept awake while it is too hot to do useful work.
 
   -t, -b and -s may be combined; whichever condition fires first stops awake.
+  --gui prevents display idle sleep, but does not unlock an already locked Mac
+  or bypass manual locking or screen saver settings.
 
 State files:
   PID file:      $HOME/.local/state/awake/awake.pid
@@ -81,7 +87,8 @@ State files:
 
 Behavior:
   - Disables clamshell sleep via `pmset -a disablesleep 1` (sudo)
-  - Prevents system idle sleep via `caffeinate -is`
+  - Prevents system idle sleep via `caffeinate -is` (`-dis` in foreground --gui)
+  - Background GUI mode adds a display-only `caffeinate -d -w <awake-pid>` assertion.
   - sudo may prompt for a password once at startup. A root helper process
     started with that single authentication restores `disablesleep 0` when
     awake exits for any reason (Ctrl+C, SIGTERM, timeout, battery limit,
@@ -273,6 +280,72 @@ format_uptime() {
   fi
 }
 
+# GUI hold is a display-only power assertion attached to the background awake PID.
+# caffeinate -w releases it automatically if that process exits, even on SIGKILL.
+gui_hold_pid() {
+  local hold main cmd
+  [[ -f "$GUI_FILE" ]] || return 1
+  read -r hold main < "$GUI_FILE" || return 1
+  [[ "$hold" =~ ^[0-9]+$ && "$main" =~ ^[0-9]+$ ]] || return 1
+  is_running "$hold" && is_running "$main" || return 1
+  local current
+  current="$(read_pid)" || return 1
+  [[ "$main" == "$current" ]] || return 1
+  cmd="$(ps -o command= -p "$hold" 2>/dev/null || true)"
+  [[ "$cmd" == "caffeinate -d -w $main" || "$cmd" == "/usr/bin/caffeinate -d -w $main" ]] || return 1
+  printf '%s' "$hold"
+}
+
+gui_on() {
+  local main hold
+  if ! main="$(read_pid)" || ! is_running "$main"; then
+    echo "awake: GUI mode requires a running background awake; run 'awake start' first." >&2
+    return 1
+  fi
+  if hold="$(gui_hold_pid)"; then
+    echo "awake: GUI mode already on (PID=$hold)"
+    return 0
+  fi
+  rm -f "$GUI_FILE"
+  nohup caffeinate -d -w "$main" >> "$LOG_FILE" 2>&1 </dev/null &
+  hold=$!
+  disown "$hold" 2>/dev/null || true
+  (umask 077; printf '%s %s\n' "$hold" "$main" > "$GUI_FILE")
+  local i
+  for (( i=0; i<20; i++ )); do
+    if gui_hold_pid >/dev/null; then
+      echo "awake: GUI mode on (display sleep inhibited; PID=$hold)"
+      echo "awake: unlock manually if locked; screen saver and manual locks are unchanged."
+      return 0
+    fi
+    sleep 0.1
+  done
+  kill -TERM "$hold" 2>/dev/null || true
+  rm -f "$GUI_FILE"
+  echo "awake: GUI hold failed to start" >&2
+  return 1
+}
+
+gui_off() {
+  local hold
+  if hold="$(gui_hold_pid)"; then
+    kill -TERM "$hold" 2>/dev/null || true
+    echo "awake: GUI mode off (display hold released)"
+  else
+    echo "awake: GUI mode already off"
+  fi
+  rm -f "$GUI_FILE"
+}
+
+gui_status() {
+  local hold
+  if hold="$(gui_hold_pid)"; then
+    echo "awake: GUI mode on (display sleep inhibited; PID=$hold)"
+  else
+    echo "awake: GUI mode off"
+  fi
+}
+
 # ---------- foreground runner (the actual work loop) ----------
 
 # ---------- update check ----------
@@ -347,6 +420,7 @@ run_foreground() {
   local timeout_secs="${2:-0}"    # 0 = no timeout
   local battery_threshold="${3:-0}" # 0 = no battery limit
   local safe_mode="${4:-0}"         # 1 = stop when hot for THERMAL_HOT_SECS
+  local gui_mode="${5:-0}"          # 1 = also keep the display awake
 
   CAFFEINATE_PID=""
   TIMER_PID=""
@@ -408,7 +482,7 @@ run_foreground() {
     fi
 
     if [[ "$mode" == "detached" ]]; then
-      rm -f "$PID_FILE" "$DEADLINE_FILE" "$BATTERY_FILE" "$SAFE_FILE"
+      rm -f "$PID_FILE" "$DEADLINE_FILE" "$BATTERY_FILE" "$SAFE_FILE" "$GUI_FILE"
     fi
   }
 
@@ -485,7 +559,11 @@ run_foreground() {
   fi
   DISABLED_SLEEP=1
 
-  caffeinate -is 9>&- &
+  if (( gui_mode )); then
+    caffeinate -dis 9>&- &
+  else
+    caffeinate -is 9>&- &
+  fi
   CAFFEINATE_PID=$!
   # Tell the helper which caffeinate to reap if we die without cleanup.
   echo "caffeinate=$CAFFEINATE_PID" >&9
@@ -580,6 +658,9 @@ run_foreground() {
   if (( safe_mode )); then
     startup_msg+=", safe"
   fi
+  if (( gui_mode )); then
+    startup_msg+=", gui"
+  fi
   startup_msg+=")"
   echo "$startup_msg"
   echo "awake: the Mac will stay awake with the lid closed. Press Ctrl+C to release and exit."
@@ -595,13 +676,14 @@ cmd_start() {
   local timeout_secs="${1:-0}"
   local battery_threshold="${2:-0}"
   local safe_mode="${3:-0}"
+  local gui_mode="${4:-0}"
   mkdir -p "$STATE_DIR"
 
   if pid="$(read_pid)" && is_running "$pid"; then
     echo "awake: already running (PID=$pid). Use 'awake stop' first." >&2
     exit 1
   fi
-  rm -f "$PID_FILE" "$DEADLINE_FILE" "$BATTERY_FILE" "$SAFE_FILE"
+  rm -f "$PID_FILE" "$DEADLINE_FILE" "$BATTERY_FILE" "$SAFE_FILE" "$GUI_FILE"
 
   # Prime sudo in the foreground so the background child can use the cached
   # credential without prompting.
@@ -619,6 +701,9 @@ cmd_start() {
   while (( waited < 30 )); do
     if pid="$(read_pid)" && is_running "$pid"; then
       echo "awake: started in background (PID=$pid)"
+      if (( gui_mode )); then
+        gui_on || return 1
+      fi
       if (( timeout_secs > 0 )); then
         echo "awake: will auto-stop after $(format_uptime "$timeout_secs")"
       fi
@@ -697,6 +782,11 @@ cmd_status() {
     fi
     if [[ -f "$SAFE_FILE" ]]; then
       echo "  safe mode:          on (stop after $(format_uptime "$THERMAL_HOT_SECS") at serious; now $(thermal_state_name "$(thermal_state)"))"
+    fi
+    if gui_hold_pid >/dev/null; then
+      echo "  gui mode:           on (display idle sleep inhibited)"
+    else
+      echo "  gui mode:           off"
     fi
     echo "  pmset disablesleep: $disablesleep"
     echo "  log:                $LOG_FILE"
@@ -778,6 +868,7 @@ cmd_stop() {
     exit 0
   fi
 
+  gui_off
   echo "awake: stopping PID $pid"
   kill -TERM "$pid" 2>/dev/null || { echo "awake: kill failed" >&2; exit 1; }
 
@@ -799,10 +890,12 @@ cmd_stop() {
 
 # ---------- dispatch ----------
 
-# Extract a subcommand and -t/-b/-s flags from arbitrary argv order.
-# Recognized subcommands: (empty)|fg|foreground|start|status|stop|__detached
+# Extract a subcommand and -t/-b/-s/--gui flags from arbitrary argv order.
+# Recognized subcommands: (empty)|fg|foreground|start|gui|status|stop|__detached
 # -t/--timeout DURATION may appear before or after the subcommand.
 SUBCMD=""
+GUI_ACTION="status"
+GUI_MODE=0
 TIMEOUT_RAW=""
 BATTERY_RAW=""
 SAFE_MODE=0
@@ -858,6 +951,22 @@ while (( $# > 0 )); do
       SAFE_MODE=1
       shift
       ;;
+    -g|--gui)
+      GUI_MODE=1
+      shift
+      ;;
+    gui)
+      if [[ -n "$SUBCMD" ]]; then
+        echo "awake: unexpected extra argument: $1" >&2
+        exit 2
+      fi
+      SUBCMD="gui"
+      shift
+      if (( $# > 0 )) && [[ "$1" == "on" || "$1" == "off" || "$1" == "status" ]]; then
+        GUI_ACTION="$1"
+        shift
+      fi
+      ;;
     fg|foreground|start|status|stop)
       if [[ -n "$SUBCMD" ]]; then
         echo "awake: unexpected extra argument: $1" >&2
@@ -905,11 +1014,18 @@ fi
 case "$SUBCMD" in
   ""|fg|foreground)
     maybe_notify_update
-    run_foreground attached "$TIMEOUT_SECS" "$BATTERY_THRESHOLD" "$SAFE_MODE"
+    run_foreground attached "$TIMEOUT_SECS" "$BATTERY_THRESHOLD" "$SAFE_MODE" "$GUI_MODE"
     ;;
   start)
     maybe_notify_update
-    cmd_start "$TIMEOUT_SECS" "$BATTERY_THRESHOLD" "$SAFE_MODE"
+    cmd_start "$TIMEOUT_SECS" "$BATTERY_THRESHOLD" "$SAFE_MODE" "$GUI_MODE"
+    ;;
+  gui)
+    case "$GUI_ACTION" in
+      on) gui_on ;;
+      off) gui_off ;;
+      status) gui_status ;;
+    esac
     ;;
   status)
     maybe_notify_update

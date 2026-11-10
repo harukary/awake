@@ -113,7 +113,7 @@ awake status     # check whether it's running (PID, uptime, pmset state)
 awake stop       # stop it; sleep settings are restored automatically
 ```
 
-State is kept under `~/.local/state/awake/` (`awake.pid`, `awake.deadline`, `awake.battery`, `awake.safe`, `awake.log`, `update-check`). Override with `AWAKE_STATE_DIR=…`.
+State is kept under `~/.local/state/awake/` (`awake.pid`, `awake.deadline`, `awake.battery`, `awake.safe`, `awake.gui.pid`, `awake.log`, `update-check`). Override with `AWAKE_STATE_DIR=…`.
 
 `awake status` also reports `pmset disablesleep`. If it shows `1` while no awake process is tracked (e.g. another tool holds it, or a run predating the root helper was force-killed), restore manually with `sudo pmset -a disablesleep 0`.
 
@@ -157,6 +157,24 @@ awake -t 8h -b 20 -s    # combine: whichever condition fires first stops awake
 
 `awake status` shows `safe mode: on` along with the current thermal state. Note that macOS already throttles and protects the hardware by itself; `-s` just stops keeping the Mac awake once it is too hot to do useful work.
 
+### GUI mode (`--gui` / `gui on|off`)
+
+For local desktop automation, prevent **display** idle sleep in addition to system sleep. This mode is OFF by default, and does not modify macOS screen lock or password settings.
+
+```bash
+awake start --gui    # New background session with GUI display hold enabled
+awake --gui          # Foreground session with GUI display hold enabled
+
+awake gui on         # Enable display hold without restarting background awake
+awake gui status     # Inspect its state
+awake gui off        # Release only display hold
+awake status         # Inspect awake and GUI mode status
+```
+
+For an existing background session, `awake gui on` runs `caffeinate -d -w <awake-pid>`. The display assertion ends automatically when the main awake process exits, even after SIGKILL. Turning it off leaves the normal system sleep prevention running. This toggle needs no sudo and does not restart awake. Foreground `awake --gui` uses `caffeinate -dis`. Time, battery and temperature limits continue to work.
+
+**GUI mode does not unlock an already locked Mac, override manual locks, or prevent an independently configured idle screen saver.** For uninterrupted desktop automation, unlock the Mac yourself and, if enabled, set System Settings > Lock Screen > *Start Screen Saver when inactive* to *Never*. For GUI operation, keep the MacBook lid open; lid-close may make the desktop unavailable even if the Mac stays awake. Keeping the display on increases power usage.
+
 ### Help / Version
 
 ```bash
@@ -191,7 +209,7 @@ It pushes `main`, creates and pushes the `vX.Y.Z` tag, and updates the Homebrew 
 ## How it works
 
 1. A single `sudo` authentication at startup launches a small **root helper** process. The helper runs `pmset -a disablesleep 1` — disabling clamshell (lid-close) sleep on both AC and battery power — and then blocks on a FIFO held open by the main `awake` process.
-2. `caffeinate -is` — also prevents system idle sleep while the script is running.
+2. `caffeinate -is` — also prevents system idle sleep while the script is running. GUI mode adds a `caffeinate -d` display assertion (or uses `-dis` in foreground mode).
 3. When `awake` exits for any reason — Ctrl+C, `awake stop`, `-t` timeout, `-b` battery limit, `-s` thermal limit, `SIGTERM`, even `kill -9` — the FIFO reaches EOF and the helper restores `pmset -a disablesleep 0` with the root privileges it already holds. Because the helper never needs a fresh `sudo` credential, **no password prompt appears at exit**, so timed runs release automatically even when you're away from the machine.
 
 ## Caveats
